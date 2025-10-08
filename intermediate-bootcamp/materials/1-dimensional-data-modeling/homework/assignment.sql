@@ -1,7 +1,6 @@
 -- Set default schema to public
 SET search_path TO public;
 
-
 -- DDL for actor_films:
 CREATE TABLE IF NOT EXISTS public.actor_films
 (
@@ -13,162 +12,160 @@ CREATE TABLE IF NOT EXISTS public.actor_films
     rating real,
     filmid text COLLATE pg_catalog."default" NOT NULL,
     CONSTRAINT actor_films_pkey PRIMARY KEY (actorid, filmid)
-)
+);
 
-/*
-DDL for actors table: Create a DDL for an actors table with the following fields:
-
-films: An array of struct with the following fields:
-
-film: The name of the film.
-votes: The number of votes the film received.
-rating: The rating of the film.
-filmid: A unique identifier for each film.
-quality_class: This field represents an actor's performance quality, determined by the average rating of movies of their most recent year. It's categorized as follows:
-
-star: Average rating > 8.
-good: Average rating > 7 and ≤ 8.
-average: Average rating > 6 and ≤ 7.
-bad: Average rating ≤ 6.
-is_active: A BOOLEAN field that indicates whether an actor is currently active in the film industry (i.e., making films this year).
-
-*/
-
--- drop type if exists film_info cascade;
-DROP TYPE IF EXISTS film_info CASCADE;
+-- Drop tables before dropping type to avoid CASCADE
+DROP TABLE IF EXISTS public.actors CASCADE;
+DROP TABLE IF EXISTS public.actors_history_scd CASCADE;
+DROP TYPE IF EXISTS film_info;
 
 -- Create a composite type for film information
 CREATE TYPE film_info AS (
     film VARCHAR(255),
     votes INT,
-    rating FLOAT,
+    rating real,
     filmid VARCHAR(255)
 );
 
--- drop table if exists actors cascade;
-DROP TABLE IF EXISTS public.actors CASCADE;
-
+-- actors table: one row per actor, films from most recent year, PK on actorid
 CREATE TABLE IF NOT EXISTS public.actors
 (
-    actorid text COLLATE pg_catalog."default" NOT NULL,
-    actor TEXT COLLATE pg_catalog."default" NOT NULL,
-    year INTEGER NOT NULL,
-    films film_info[],  -- Array of composite type
-    quality_class VARCHAR(10) CHECK (quality_class IN ('star', 'good', 'average', 'bad')),
+    actorid text PRIMARY KEY,
+    actor TEXT NOT NULL,
+    films film_info[] NOT NULL,
+    quality_class VARCHAR(10) NOT NULL CHECK (quality_class IN ('star', 'good', 'average', 'bad')),
     is_active BOOLEAN NOT NULL
 );
 
--- Get all unique actors
-WITH actors_list AS (
-    SELECT DISTINCT actorid, actor
+-- Populate actors table: films from most recent year, quality_class from that year, is_active for current year
+WITH latest_years AS (
+    SELECT actorid, MAX(year) AS latest_year
     FROM public.actor_films
+    GROUP BY actorid
 ),
-years AS (
-    SELECT DISTINCT year
-    FROM public.actor_films
-),
-actor_years AS (
-    SELECT a.actorid, a.actor, y.year
-    FROM actors_list a
-    CROSS JOIN years y
-)
-
-INSERT INTO public.actors (actorid, actor, year, films, quality_class, is_active)
-SELECT
-    ay.actorid,
-    ay.actor,
-    ay.year,
-    COALESCE(
+films_latest AS (
+    SELECT
+        af.actorid,
+        MAX(af.actor) AS actor,
         ARRAY_AGG(
             ROW(af.film, af.votes, af.rating, af.filmid)::film_info
-        ) FILTER (WHERE af.filmid IS NOT NULL),
-        ARRAY[]::film_info[]
-    ) AS films,
+            ORDER BY af.votes DESC NULLS LAST
+        ) AS films,
+        AVG(af.rating) AS avg_rating
+    FROM public.actor_films af
+    JOIN latest_years ly ON ly.actorid = af.actorid AND ly.latest_year = af.year
+    GROUP BY af.actorid
+)
+INSERT INTO public.actors (actorid, actor, films, quality_class, is_active)
+SELECT
+    fl.actorid,
+    fl.actor,
+    fl.films,
     CASE
-        WHEN COUNT(af.rating) FILTER (WHERE af.rating IS NOT NULL) = 0 THEN 'bad'
-        WHEN AVG(af.rating) > 8 THEN 'star'
-        WHEN AVG(af.rating) > 7 THEN 'good'
-        WHEN AVG(af.rating) > 6 THEN 'average'
+        WHEN fl.avg_rating > 8 THEN 'star'
+        WHEN fl.avg_rating > 7 THEN 'good'
+        WHEN fl.avg_rating > 6 THEN 'average'
         ELSE 'bad'
     END AS quality_class,
-    CASE
-        WHEN COUNT(af.filmid) > 0 THEN TRUE
-        ELSE FALSE
-    END AS is_active
-FROM
-    actor_years ay
-LEFT JOIN
-    public.actor_films af
-    ON ay.actorid = af.actorid AND ay.year = af.year
-GROUP BY
-    ay.actorid, ay.actor, ay.year;
+    EXISTS (
+        SELECT 1 FROM public.actor_films af2
+        WHERE af2.actorid = fl.actorid
+          AND af2.year = EXTRACT(YEAR FROM CURRENT_DATE)
+    ) AS is_active
+FROM films_latest fl;
 
-/* Create a DDL for an `actors_history_scd` table with the following features:
-    - Implements type 2 dimension modeling (i.e., includes `start_date` and `end_date` fields).
-    - Tracks `quality_class` and `is_active` status for each actor in the `actors` table.
-    */
-    
--- drop table if exists actors_history_scd cascade;
-DROP TABLE IF EXISTS public.actors_history_scd CASCADE;
-
+-- actors_history_scd: type 2 SCD, year granularity, PK on (actorid, start_year)
+-- If strict DATE granularity is required, use DATE columns and adjust logic accordingly.
 CREATE TABLE IF NOT EXISTS public.actors_history_scd
 (
-    actorid text COLLATE pg_catalog."default" NOT NULL,
-    actor TEXT COLLATE pg_catalog."default" NOT NULL,
+    actorid text NOT NULL,
+    actor TEXT NOT NULL,
     quality_class VARCHAR(10) CHECK (quality_class IN ('star', 'good', 'average', 'bad')),
     is_active BOOLEAN NOT NULL,
-    start_year INTEGER NOT NULL,
-    end_year INTEGER, -- NULL indicates current record
-    current_year INTEGER,
+    start_date INTEGER NOT NULL,
+    end_date INTEGER, -- NULL indicates current record
     CONSTRAINT actors_history_scd_pkey PRIMARY KEY (actorid, start_year)
 );
 
--- Write a "backfill" query that can populate the entire `actors_history_scd` table in a single query from the data in the 'actors' table
-WITH streak_started AS (
-    SELECT
-        actorid,
-        actor,
-        year AS current_year,
-        quality_class,
-        is_active,
-        LAG(quality_class, 1) OVER (PARTITION BY actorid ORDER BY year) <> quality_class
-            OR LAG(is_active, 1) OVER (PARTITION BY actorid ORDER BY year) <> is_active
-            OR LAG(quality_class, 1) OVER (PARTITION BY actorid ORDER BY year) IS NULL
-            OR LAG(is_active, 1) OVER (PARTITION BY actorid ORDER BY year) IS NULL
-            AS did_change
-    FROM public.actors
+-- SCD backfill: generate a continuous year series for each actor, track is_active and quality_class changes
+-- Note: We use actor_films as the source because actors only holds the latest snapshot.
+-- This is necessary to reconstruct history.
+WITH bounds AS (
+    SELECT actorid, MAX(actor) AS actor, MIN(year) AS min_y, GREATEST(MAX(year), EXTRACT(YEAR FROM CURRENT_DATE)::int) AS max_y
+    FROM public.actor_films
+    GROUP BY actorid
 ),
-streak_identified AS (
-    SELECT
-        actorid,
-        actor,
-        quality_class,
-        is_active,
-        current_year,
-        SUM(CASE WHEN did_change THEN 1 ELSE 0 END)
-            OVER (PARTITION BY actorid ORDER BY current_year) AS streak_identifier
-    FROM streak_started
+years AS (
+    SELECT b.actorid, b.actor, y AS year
+    FROM bounds b
+    CROSS JOIN LATERAL generate_series(b.min_y, b.max_y) AS y
 ),
-aggregated AS (
+agg AS (
+    SELECT actorid, year, AVG(rating) AS avg_rating, COUNT(*) AS cnt
+    FROM public.actor_films
+    GROUP BY actorid, year
+),
+classified AS (
+    SELECT
+        y.actorid,
+        y.actor,
+        y.year AS current_year,
+        CASE
+            WHEN a.avg_rating > 8 THEN 'star'
+            WHEN a.avg_rating > 7 THEN 'good'
+            WHEN a.avg_rating > 6 THEN 'average'
+            WHEN a.avg_rating IS NULL THEN NULL
+            ELSE 'bad'
+        END AS quality_class,
+        COALESCE(a.cnt > 0, FALSE) AS is_active
+    FROM years y
+    LEFT JOIN agg a USING (actorid, year)
+),
+streak_flags AS (
+    SELECT
+        *,
+        CASE
+            WHEN LAG(quality_class) OVER (PARTITION BY actorid ORDER BY current_year) IS DISTINCT FROM quality_class
+              OR LAG(is_active)     OVER (PARTITION BY actorid ORDER BY current_year) IS DISTINCT FROM is_active
+            THEN 1 ELSE 0
+        END AS change_flag
+    FROM classified
+),
+streaks AS (
+    SELECT
+        *,
+        SUM(change_flag) OVER (PARTITION BY actorid ORDER BY current_year ROWS UNBOUNDED PRECEDING) AS grp_id
+    FROM streak_flags
+),
+ranges AS (
     SELECT
         actorid,
-        actor,
+        MAX(actor) AS actor,
         quality_class,
         is_active,
-        streak_identifier,
         MIN(current_year) AS start_year,
         MAX(current_year) AS end_year
-    FROM streak_identified
-    GROUP BY actorid, actor, quality_class, is_active, streak_identifier
+    FROM streaks
+    GROUP BY actorid, grp_id, quality_class, is_active
+),
+final AS (
+    SELECT
+        r.actorid,
+        r.actor,
+        r.quality_class,
+        r.is_active,
+        r.start_year,
+        CASE WHEN r.end_year = MAX(r.end_year) OVER (PARTITION BY r.actorid)
+             THEN NULL
+             ELSE r.end_year
+        END AS end_year
+    FROM ranges r
 )
-INSERT INTO public.actors_history_scd (actorid, actor, quality_class, is_active, start_year, end_year, current_year)
-SELECT
-    actorid,
-    actor,
-    quality_class,
-    is_active,
-    start_year,
-    end_year,
-    end_year AS current_year
-FROM aggregated
+INSERT INTO public.actors_history_scd (actorid, actor, quality_class, is_active, start_year, end_year)
+SELECT actorid, actor, quality_class, is_active, start_year, end_year
+FROM final
 ORDER BY actorid, start_year;
+
+-- Optional: Add indexes for SCD current record and range queries
+-- CREATE INDEX IF NOT EXISTS idx_actors_history_scd_current ON public.actors_history_scd(actorid) WHERE end_year IS NULL;
+-- CREATE INDEX IF NOT EXISTS idx_actors_history_scd_range ON public.actors_history_scd(actorid, start_year, end_year);
