@@ -40,7 +40,8 @@
 
 -- A query to deduplicate `game_details` from Day 1 so there's no duplicates
 -- Create a deduplicated version of game_details
-DROP TABLE IF EXISTS public.game_details_dedup;
+
+-- DROP TABLE IF EXISTS public.game_details_dedup;
 
 CREATE TABLE IF NOT EXISTS public.game_details_dedup AS
 WITH ranked AS (
@@ -50,13 +51,14 @@ WITH ranked AS (
       PARTITION BY gd.game_id, gd.team_id, gd.player_id
       ORDER BY
         (gd.min IS NOT NULL)::int DESC,
-        NULLIF(CASE
-          WHEN gd.min ~ '^\d{1,2}\.\d+:\d{2}$' THEN REGEXP_REPLACE(gd.min, '^(\d+)\.\d+:(\d+)$', '\1:\2') -- Convert invalid format
-          WHEN gd.min ~ '^(\d{1,2}):60$' THEN REGEXP_REPLACE(gd.min, '^(\d{1,2}):60$', '\1:59')
-          WHEN gd.min ~ '^\d{1,2}:\d{2}$' THEN gd.min -- Keep valid format
-          ELSE NULL
-        END, '')::interval DESC,
-        gd.player_id
+        NULLIF(
+          make_interval(
+            mins => split_part(gd.min, ':', 1)::NUMERIC::INT,
+            secs => split_part(gd.min, ':', 2)::NUMERIC::INT
+          ),
+          NULL
+        ) DESC,
+        COALESCE(gd.plus_minus, -99999) DESC
     ) AS rn
   FROM public.game_details gd
 )
@@ -103,13 +105,12 @@ WHERE rn = 1;
 --  - data type here should look similar to `MAP<STRING, ARRAY[DATE]>`
 --    - or you could have `browser_type` as a column with multiple rows for each user (either way works, just be consistent!)
 
-DROP TABLE IF EXISTS public.user_devices_cumulated;
+-- DROP TABLE IF EXISTS public.user_devices_cumulated;
 
 CREATE TABLE IF NOT EXISTS public.user_devices_cumulated (
     user_id numeric NOT NULL, -- Use BIGINT for user_id
     browser_type TEXT NOT NULL,
     device_activity_datelist DATE[] NOT NULL DEFAULT '{}', -- Default empty array
-    activity_bits_month INT, -- Base-2 bitmask for monthly activity
     PRIMARY KEY (user_id, browser_type)
 );
 
@@ -134,6 +135,11 @@ SET device_activity_datelist = (
                 || EXCLUDED.device_activity_datelist) AS t(d)
   ) s
 );
+-- Write a `datelist_int` generation query.
+ALTER TABLE public.user_devices_cumulated
+ADD COLUMN datelist_int INT;
+
+-- Convert the `device_activity_datelist` column into a `datelist_int` column
 
 -- Compute the bitmask for existing data
 WITH exploded AS (
@@ -151,18 +157,18 @@ bits AS (
   SELECT
     user_id,
     browser_type,
-    SUM((1::int) << day_idx) AS month_bits
+    SUM((1::int) << day_idx) AS datelist_int
   FROM exploded
   GROUP BY user_id, browser_type
 )
 UPDATE public.user_devices_cumulated u
-SET activity_bits_month = b.month_bits
+SET datelist_int = b.datelist_int   
 FROM bits b
 WHERE u.user_id = b.user_id AND u.browser_type = b.browser_type;
 
 -- Create a DDL for `hosts_cumulated` table
 -- Create a `host_activity_datelist` which logs to see which dates each host is experiencing any activity
-DROP TABLE IF EXISTS public.hosts_cumulated;
+-- DROP TABLE IF EXISTS public.hosts_cumulated;
 
 CREATE TABLE IF NOT EXISTS public.hosts_cumulated (
     host TEXT NOT NULL,
@@ -187,32 +193,6 @@ SET host_activity_datelist = (
                 || EXCLUDED.host_activity_datelist) AS t(d)
   ) s
 );
-
--- Create a `datelist_int` generation query for `hosts_cumulated` table
-ALTER TABLE public.hosts_cumulated
-ADD COLUMN activity_bits_month BIGINT;
-
--- Compute the bitmask for existing data
-WITH exploded AS (
-  SELECT
-    u.host,
-    d::date AS activity_date,
-    DATE_TRUNC('month', d)::date AS month_start,
-    (EXTRACT(day FROM d)::int - 1) AS day_idx
-  FROM public.hosts_cumulated u
-  CROSS JOIN LATERAL unnest(u.host_activity_datelist) AS t(d)
-),
-bits AS (
-  SELECT
-    host,
-    SUM((1::bigint) << day_idx) AS month_bits
-  FROM exploded
-  GROUP BY host
-)
-UPDATE public.hosts_cumulated u
-SET activity_bits_month = b.month_bits
-FROM bits b
-WHERE u.host = b.host;
 
 -- Create a monthly, reduced fact table DDL `host_activity_reduced`
 --  - month
