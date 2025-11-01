@@ -1,286 +1,163 @@
-# %%
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import expr, col
-spark = SparkSession.builder.appName("SparkHomework").getOrCreate()
+from pyspark.sql.functions import col, broadcast, desc, sum as F_sum, countDistinct
 
-spark
+# Enable Hive support for bucketed joins
+spark = SparkSession.builder \
+    .appName("SparkHomework") \
+    .enableHiveSupport() \
+    .getOrCreate()
 
+# Set configurations
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
-spark.conf.set("spark.sql.bucketing.enabled", "1")
+spark.conf.set("spark.sql.bucketing.enabled", "true")
 
-maps = spark.read.option("header", "true").csv("/home/iceberg/data/maps.csv").select(col("mapid"), col("name").alias("map_name"), col("description").alias("map_description"))
-medals = spark.read.option("header","true").csv("/home/iceberg/data/medals.csv")
-medals_matches_players = spark.read.option("header", "true").csv("/home/iceberg/data/medals_matches_players.csv")
-matches = spark.read.option("header", "true").csv("/home/iceberg/data/matches.csv")
+# Ensure database exists
+spark.sql("CREATE DATABASE IF NOT EXISTS bootcamp")
 
-
-# %%
-print(maps.count())
-maps.show()
-
-# %%
-print(medals_matches_players.count())
-medals_matches_players.show()
-
-# %%
-print(matches.count())
-matches.show()
-
-# %%
-print(medals.count())
-medals.show()
-
-
-# %%
-from pyspark.sql.functions import bucket
-
-
+# Load datasets with proper schema inference
+maps = spark.read.option("header", "true").option("inferSchema", "true").csv("/home/iceberg/data/maps.csv") \
+    .select(col("mapid"), col("name").alias("map_name"), col("description").alias("map_description"))
+medals = spark.read.option("header", "true").option("inferSchema", "true").csv("/home/iceberg/data/medals.csv")
+medals_matches_players = spark.read.option("header", "true").option("inferSchema", "true").csv("/home/iceberg/data/medals_matches_players.csv")
 matches = spark.read.option("header", "true").option("inferSchema", "true").csv("/home/iceberg/data/matches.csv")
-# matches.show()
+match_details = spark.read.option("header", "true").option("inferSchema", "true").csv("/home/iceberg/data/match_details.csv")
 
+# Query 2: Explicit broadcast joins for medals and maps
+# Example broadcast join between medals and maps (even though unrelated)
+medals_broadcast = broadcast(medals)
+maps_broadcast = broadcast(maps)
 
-# %%
-%%sql
-DROP TABLE IF EXISTS bootcamp.matches_bucketed
+# Demo broadcast join (cross join for demonstration)
+demo_broadcast_join = medals_broadcast.crossJoin(maps_broadcast).limit(5)
+print("Demo broadcast join of medals and maps:")
+demo_broadcast_join.show()
 
-# %%
-%%sql
-CREATE TABLE
-  IF NOT EXISTS bootcamp.matches_bucketed (
-    match_id STRING,
-    mapid STRING,
-    is_team_game BOOLEAN,
-    playlist_id STRING,
-    game_variant_id STRING,
-    is_match_over BOOLEAN,
-    completion_date TIMESTAMP,
-    match_duration STRING,
-    game_mode STRING,
-    map_variant_id STRING
-  ) USING iceberg PARTITIONED BY (bucket(16, match_id))
+# Query 3: Bucket join across three tables on match_id with 16 buckets
+def write_bucketed(df, table_name):
+    (df.write
+       .format("orc")
+       .bucketBy(16, "match_id")
+       .sortBy("match_id")
+       .mode("overwrite")
+       .saveAsTable(table_name))
 
-# %%
-matches.write.mode("append").bucketBy(16,"match_id").saveAsTable("bootcamp.matches_bucketed")
+# Prepare and write bucketed tables
+matches_prepared = matches.select("match_id", "mapid", "playlist_id", "game_mode", "completion_date")
+match_details_prepared = match_details.select("match_id", "player_gamertag", 
+                                             col("player_total_kills").cast("int").alias("player_total_kills"))
+mmp_prepared = medals_matches_players.select("match_id", "medal_id", 
+                                            col("COUNT").cast("int").alias("medal_count"))
 
-# %%
-%%sql
-SELECT
-  COUNT(1)
-FROM
-  bootcamp.matches_bucketed.files
+write_bucketed(matches_prepared, "bootcamp.matches_b16")
+write_bucketed(match_details_prepared, "bootcamp.match_details_b16")
+write_bucketed(mmp_prepared, "bootcamp.mmp_b16")
 
-# %%
+# Read back bucketed tables and perform bucket join
+md_b = spark.table("bootcamp.match_details_b16")
+m_b = spark.table("bootcamp.matches_b16")
+mmp_b = spark.table("bootcamp.mmp_b16")
 
-match_details = spark.read.option("header","true").option("inferSchema", "true").csv("/home/iceberg/data/match_details.csv")
-match_details.show()
+# 3-way bucket join
+bucketed_join = (m_b.join(md_b, "match_id")
+                   .join(mmp_b, "match_id"))
 
+print("Bucketed join result (sample):")
+bucketed_join.limit(10).show()
 
-# %%
-%%sql
-DROP TABLE IF EXISTS bootcamp.match_details_bucketed
+# Query 4: Analytical queries with proper casting and broadcast joins
 
-# %%
-%%sql
-CREATE TABLE
-  IF NOT EXISTS bootcamp.match_details_bucketed (
-    match_id STRING,
-    player_gamertag STRING,
-    previous_spartan_rank INTEGER,
-    spartan_rank INTEGER,
-    previous_total_xp INTEGER,
-    total_xp INTEGER,
-    previous_csr_tier STRING,
-    previous_csr_designation STRING,
-    previous_csr INTEGER,
-    previous_csr_percent_to_next_tier STRING,
-    previous_csr_rank INTEGER,
-    current_csr_tier STRING,
-    current_csr_designation STRING,
-    current_csr INTEGER,
-    current_csr_percent_to_next_tier STRING,
-    current_csr_rank INTEGER,
-    player_rank_on_team STRING,
-    player_finished BOOLEAN,
-    player_average_life STRING,
-    player_total_kills INTEGER,
-    player_total_headshots INTEGER,
-    player_total_weapon_damage FLOAT,
-    player_total_shots_landed INTEGER,
-    player_total_melee_kills INTEGER,
-    player_total_melee_damage FLOAT,
-    player_total_assassinations INTEGER,
-    player_total_ground_pound_kills INTEGER,
-    player_total_shoulder_bash_kills INTEGER,
-    player_total_grenade_damage FLOAT,
-    player_total_power_weapon_damage FLOAT,
-    player_total_power_weapon_grabs INTEGER,
-    player_total_deaths INTEGER,
-    player_total_assists INTEGER,
-    player_total_grenade_kills INTEGER,
-    did_win INTEGER,
-    team_id STRING
-  ) USING iceberg PARTITIONED BY (bucket(16, match_id));
+# Query 4a: Player with highest average kills per game
+md_casted = match_details.select(
+    "player_gamertag",
+    "match_id", 
+    col("player_total_kills").cast("int").alias("player_total_kills")
+)
 
-# %%
-match_details.write.mode("append").bucketBy(16,"match_id").saveAsTable("bootcamp.match_details_bucketed")
+res = (md_casted.groupBy("player_gamertag")
+         .agg(F_sum("player_total_kills").alias("sum_kills"),
+              countDistinct("match_id").alias("games"))
+         .withColumn("avg_kills_per_game", col("sum_kills") / col("games"))
+         .orderBy(desc("avg_kills_per_game"))
+         .limit(1))
 
-# %%
+print("Player with highest average kills per game:")
+res.show()
 
+# Query 4b: Playlist with most plays
+playlist_plays = matches.groupBy("playlist_id") \
+    .agg(countDistinct("match_id").alias("plays")) \
+    .orderBy(desc("plays")) \
+    .limit(1)
 
-# %%
-%%sql
-SELECT
-  SUM(file_size_in_bytes) AS size,
-  COUNT(1) AS num_files,
-  'sorted'
-FROM
-  bootcamp.match_details_bucketed.files
+print("Playlist with most plays:")
+playlist_plays.show()
 
-# %%
+# Query 4c: Most played map
+map_plays = matches.groupBy("mapid") \
+    .agg(countDistinct("match_id").alias("plays")) \
+    .orderBy(desc("plays")) \
+    .limit(1)
 
-medals_matches_players = spark.read.option("header","true").option("inferSchema", "true").csv("/home/iceberg/data/medals_matches_players.csv")
-# medals_matches_players.show()
+print("Most played map:")
+map_plays.show()
 
-# %%
-%%sql
-DROP TABLE IF EXISTS bootcamp.medals_matches_players_bucketed
+# Query 4d: Map with most Killing Spree medals (using broadcast join for medals)
+medals_b = broadcast(medals.select("medal_id", "name"))
+mmp_casted = medals_matches_players.select(
+    "match_id",
+    "medal_id", 
+    col("COUNT").cast("int").alias("medal_count")
+)
 
-# %%
-%%sql
-CREATE TABLE
-  IF NOT EXISTS bootcamp.medals_matches_players_bucketed (
-    match_id STRING,
-    player_gamertag STRING,
-    medal_id STRING,
-    COUNT INTEGER
-  ) USING iceberg PARTITIONED BY (bucket(16, match_id))
+ks = (mmp_casted.join(medals_b, "medal_id")
+        .where(col("name") == "Killing Spree")
+        .groupBy("match_id")
+        .agg(F_sum("medal_count").alias("ks_per_match")))
 
-# %%
-medals_matches_players.write.mode("append").bucketBy(16,"match_id").saveAsTable("bootcamp.medals_matches_players_bucketed")
+ks_by_map = (ks.join(broadcast(matches.select("match_id", "mapid")), "match_id")
+               .groupBy("mapid")
+               .agg(F_sum("ks_per_match").alias("ks_total"))
+               .orderBy(desc("ks_total"))
+               .limit(1))
 
-# %%
-%%sql
-SELECT
-  SUM(file_size_in_bytes) AS size,
-  COUNT(1) AS num_files,
-  'sorted'
-FROM
-  bootcamp.medals_matches_players_bucketed.files
+result = ks_by_map.join(broadcast(maps.select("mapid", "map_name")), "mapid") \
+                  .select("map_name", "ks_total")
 
-# %%
-match_details_bucketed = spark.table("bootcamp.match_details_bucketed")
-matches_bucketed = spark.table("bootcamp.matches_bucketed")
-medals_matches_players_bucketed = spark.table("bootcamp.medals_matches_players_bucketed").select(col("match_id"), col("player_gamertag").alias("mmp_palyer_gamertag"), col("medal_id"))
+print("Map with most Killing Spree medals:")
+result.show()
 
-# %%
-from pyspark.sql.functions import broadcast
+# Query 5: Data size optimization with partitioning and sortWithinPartitions
+# Define base dataframe for partitioning experiments
+base_df = matches.select("match_id", "mapid", "playlist_id", "game_mode", "completion_date")
 
-matches_bucketed_with_maps = matches_bucketed.join(broadcast(maps),"mapid")
-matches_bucketed_with_maps.show()
+# Variant A: Partitioned by mapid
+base_df.repartition("mapid").write.mode("overwrite").format("parquet").partitionBy("mapid").saveAsTable("bootcamp.by_mapid_unsorted")
 
-# %%
+base_df.repartition("mapid").sortWithinPartitions("match_id").write.mode("overwrite").format("parquet").partitionBy("mapid").saveAsTable("bootcamp.by_mapid_sorted")
 
-df = match_details_bucketed.join(matches_bucketed_with_maps, "match_id").join(medals_matches_players_bucketed,"match_id").join(broadcast(medals),"medal_id")
-df.show();
-df.explain()
+# Variant B: Partitioned by playlist_id
+base_df.repartition("playlist_id").write.mode("overwrite").format("parquet").partitionBy("playlist_id").saveAsTable("bootcamp.by_playlist_unsorted")
 
-# %%
-# Which player averages the most kills per game?
-from pyspark.sql.functions import desc
-from pyspark.sql import functions as F
+base_df.repartition("playlist_id").sortWithinPartitions("match_id").write.mode("overwrite").format("parquet").partitionBy("playlist_id").saveAsTable("bootcamp.by_playlist_sorted")
 
-aggregated = df.groupBy("match_details_bucketed.player_gamertag").agg(F.sum("player_total_kills").alias("total_kills"))
-player_kills = aggregated.orderBy(desc("total_kills"))
-player_kills.show()
+# Variant C: Partitioned by game_mode
+base_df.repartition("game_mode").write.mode("overwrite").format("parquet").partitionBy("game_mode").saveAsTable("bootcamp.by_gamemode_unsorted")
 
-player_with_most_kills = player_kills.first()["player_gamertag"] 
-player_with_most_kills
+base_df.repartition("game_mode").sortWithinPartitions("match_id").write.mode("overwrite").format("parquet").partitionBy("game_mode").saveAsTable("bootcamp.by_gamemode_sorted")
 
-# %%
-# Which playlist gets played the most?
-from pyspark.sql.functions import desc
-from pyspark.sql import functions as F
+# Size measurement for Parquet tables
+print("Size comparison results:")
 
-aggregated = df.groupBy("playlist_id").agg(F.count("playlist_id").alias("playlist_count"))
-playlist_count = aggregated.orderBy(desc("playlist_count"))
-playlist_count.show();
+print("Map ID partitioned tables:")
+spark.sql("DESCRIBE FORMATTED bootcamp.by_mapid_sorted").filter(col("col_name").isin("Num Files", "Total Size")).show(truncate=False)
+spark.sql("DESCRIBE FORMATTED bootcamp.by_mapid_unsorted").filter(col("col_name").isin("Num Files", "Total Size")).show(truncate=False)
 
-playlist_with_most_plays = playlist_count.first()["playlist_id"] 
-playlist_with_most_plays
+print("Playlist ID partitioned tables:")
+spark.sql("DESCRIBE FORMATTED bootcamp.by_playlist_sorted").filter(col("col_name").isin("Num Files", "Total Size")).show(truncate=False)
+spark.sql("DESCRIBE FORMATTED bootcamp.by_playlist_unsorted").filter(col("col_name").isin("Num Files", "Total Size")).show(truncate=False)
 
-# %%
-# Which map gets played the most?
-from pyspark.sql.functions import desc
-from pyspark.sql import functions as F
+print("Game mode partitioned tables:")
+spark.sql("DESCRIBE FORMATTED bootcamp.by_gamemode_sorted").filter(col("col_name").isin("Num Files", "Total Size")).show(truncate=False)
+spark.sql("DESCRIBE FORMATTED bootcamp.by_gamemode_unsorted").filter(col("col_name").isin("Num Files", "Total Size")).show(truncate=False)
 
-aggregated = df.groupBy("mapid").agg(F.count("mapid").alias("map_count"))
-map_count = aggregated.orderBy(desc("map_count"))
-map_count.show();
-
-map_with_most_plays = map_count.join(broadcast(maps),"mapid").first()["map_name"]
-map_with_most_plays
-
-# %%
-# Which map do players get the most Killing Spree medals on?
-from pyspark.sql.functions import desc
-from pyspark.sql import functions as F
-
-killing_spree_medal_id = medals.filter(F.col("name") == "Killing Spree").first()["medal_id"]
-killing_spree_medal_id
-
-
-# %%
-
-aggregated = df.filter(F.col("medal_id") == killing_spree_medal_id).groupBy("mapid").agg(F.count("mapid").alias("map_count"))
-map_count = aggregated.orderBy(desc("map_count"))
-map_count.show();
-
-map_with_most_killing_spree_medals = map_count.join(broadcast(maps),"mapid").first()["map_name"]
-map_with_most_killing_spree_medals
-
-# %%
-start_df = df.repartition(16, col("mapid")).withColumn("mapid",col("mapid"))
-    
-first_sort_df = start_df.sortWithinPartitions(col("mapid"))
-
-start_df.write.mode("overwrite").saveAsTable("bootcamp.map_games_unsorted")
-first_sort_df.write.mode("overwrite").saveAsTable("bootcamp.map_games_sorted")
-
-
-# %%
-%%sql
-
-SELECT SUM(file_size_in_bytes) as size, COUNT(1) as num_files, 'sorted' 
-FROM demo.bootcamp.map_games_sorted.files
-
-UNION ALL
-SELECT SUM(file_size_in_bytes) as size, COUNT(1) as num_files, 'unsorted' 
-FROM demo.bootcamp.map_games_unsorted.files
-
-
-
-# %%
-start_df = df.repartition(16, col("playlist_id")).withColumn("playlist_id",col("playlist_id"))
-    
-first_sort_df = start_df.sortWithinPartitions(col("playlist_id"))
-
-start_df.write.mode("overwrite").saveAsTable("bootcamp.playlist_games_unsorted")
-first_sort_df.write.mode("overwrite").saveAsTable("bootcamp.playlist_games_sorted")
-
-
-# %%
-%%sql
-
-SELECT SUM(file_size_in_bytes) as size, COUNT(1) as num_files, 'sorted' 
-FROM demo.bootcamp.playlist_games_sorted.files
-
-UNION ALL
-SELECT SUM(file_size_in_bytes) as size, COUNT(1) as num_files, 'unsorted' 
-FROM demo.bootcamp.playlist_games_unsorted.files
-
-
-
-# %%
-
-
-
+print("Assignment completed successfully!")
